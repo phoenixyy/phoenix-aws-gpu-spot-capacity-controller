@@ -17,6 +17,7 @@ class ZoneDiscovery:
     eligible: bool
     reason: str | None
     approved_subnet_id: str | None = None
+    state: str | None = None
 
 
 @dataclass(frozen=True)
@@ -34,10 +35,16 @@ def discover_region(
 ) -> RegionDiscovery:
     """Read Local Zone prerequisites without opting in or changing networking."""
     zones = ec2.describe_availability_zones(AllAvailabilityZones=True).get("AvailabilityZones", [])
-    offerings = ec2.describe_instance_type_offerings(
-        LocationType="availability-zone-id",
-        Filters=[{"Name": "instance-type", "Values": instance_types}],
-    ).get("InstanceTypeOfferings", [])
+    request = {
+        "LocationType": "availability-zone-id",
+        "Filters": [{"Name": "instance-type", "Values": instance_types}],
+    }
+    pages = ec2.get_paginator("describe_instance_type_offerings").paginate(**request) if hasattr(ec2, "get_paginator") else [ec2.describe_instance_type_offerings(**request)]
+    offerings = []
+    for page in pages:
+        if not hasattr(ec2, "get_paginator") and page.get("NextToken"):
+            raise ValueError("offering inventory is incomplete without a paginator")
+        offerings.extend(page.get("InstanceTypeOfferings", []))
     offered: dict[str, list[str]] = {}
     for item in offerings:
         offered.setdefault(item["Location"], []).append(item["InstanceType"])
@@ -65,10 +72,11 @@ def discover_region(
                 reason = "approved-subnet-unavailable"
             else:
                 reason = "h100-offering-unavailable"
-        result.append(ZoneDiscovery(zone["ZoneName"], zone_id, kind, opt_in, eligible, reason, subnet_id))
+        result.append(ZoneDiscovery(zone["ZoneName"], zone_id, kind, opt_in, eligible, reason, subnet_id, zone.get("State")))
     return RegionDiscovery(region, tuple(result), {key: tuple(sorted(value)) for key, value in offered.items()})
 
 
 def ec2_client(profile: str, region: str) -> Any:
     import boto3
-    return boto3.Session(profile_name=profile, region_name=region).client("ec2")
+    from .sdk import client_config
+    return boto3.Session(profile_name=profile, region_name=region).client("ec2", config=client_config())

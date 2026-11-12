@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
+from datetime import datetime, timedelta, timezone
+import re
 from pathlib import Path
 from typing import Any, Literal
 
@@ -16,6 +18,7 @@ ACCELERATOR_CATALOG: dict[str, dict[str, tuple[str, int, int]]] = {
     "functional-validation": {
         "g6e.xlarge": ("L40S", 1, 0),
     },
+    "cpu-validation": {"c6i.large": ("CPU", 0, 0)},
 }
 VALIDATION_REGIONS = ("ap-northeast-1", "ap-northeast-2")
 VALIDATION_PURPOSE_TAG = "functional-validation"
@@ -89,7 +92,7 @@ class CapacityTarget:
     candidate_regions: tuple[RegionInputs, ...]
     instance_types: tuple[InstanceType, ...]
     region_selection: RegionSelectionPolicy = field(default_factory=RegionSelectionPolicy)
-    accelerator_profile: Literal["gpu-production", "functional-validation"] = "gpu-production"
+    accelerator_profile: Literal["gpu-production", "functional-validation", "cpu-validation"] = "gpu-production"
     integration_mode: Literal["standalone", "existing-eks"] = "standalone"
     price_cap_source: Literal["linux-ondemand"] = "linux-ondemand"
     zone_expansion_minutes: int = 15
@@ -99,6 +102,27 @@ class CapacityTarget:
     excess_instance_termination: bool = False
     notification_topic_arn: str | None = None
     ownership_tags: dict[str, str] = field(default_factory=dict)
+    acquisition_profile: Literal["generic", "hyd-b300"] = "generic"
+    placement_strategy: Literal["sequential", "all-approved"] = "sequential"
+
+    validation_run_id: str | None = None
+    validation_started_at: str | None = None
+    validation_expires_at: str | None = None
+    validation_review_budget_usd: Decimal = Decimal("1.00")
+
+    def validation_window_status(self, now: datetime) -> str | None:
+        if self.accelerator_profile != "cpu-validation" or not self.enabled:
+            return None
+        self.validate()
+        start = parse_validation_timestamp(self.validation_started_at)
+        expiry = parse_validation_timestamp(self.validation_expires_at)
+        if now.tzinfo is None or now.utcoffset() is None:
+            raise ConfigurationError("validation clock must be timezone-aware")
+        if now < start:
+            return "validation_not_started"
+        if now >= expiry:
+            return "validation_expired"
+        return None
 
     def region_inputs(self, region: str) -> RegionInputs:
         for item in self.candidate_regions:
@@ -126,12 +150,18 @@ class CapacityTarget:
             raise ConfigurationError("region_selection.mode must be manual, recommend, or auto_initial")
         if min(self.region_selection.signal_max_age_minutes, self.region_selection.decision_ttl_minutes) < 1:
             raise ConfigurationError("region-selection signal age and decision TTL must be positive")
+        if self.acquisition_profile not in {"generic", "hyd-b300"}:
+            raise ConfigurationError("acquisition_profile must be generic or hyd-b300")
+        if self.placement_strategy not in {"sequential", "all-approved"}:
+            raise ConfigurationError("placement_strategy must be sequential or all-approved")
+        if self.placement_strategy == "all-approved" and any(item.local_zone_placements for item in self.candidate_regions):
+            raise ConfigurationError("all-approved permits only standard AZ placements")
         if self.integration_mode not in {"standalone", "existing-eks"}:
             raise ConfigurationError("integration_mode must be standalone or existing-eks")
-        if self.accelerator_profile not in {"gpu-production", "functional-validation"}:
+        if self.accelerator_profile not in {"gpu-production", "functional-validation", "cpu-validation"}:
             if self.accelerator_profile == "h100-production":
                 raise ConfigurationError("h100-production is retired; remove accelerator_profile to use generic GPU production")
-            raise ConfigurationError("accelerator_profile must be gpu-production or functional-validation")
+            raise ConfigurationError("accelerator_profile must be gpu-production, functional-validation or cpu-validation")
         if min(self.zone_expansion_minutes, self.region_failover_minutes, self.failover_approval_minutes) < 1:
             raise ConfigurationError("thresholds must be positive")
         regions = [item.region for item in self.candidate_regions]
@@ -145,6 +175,55 @@ class CapacityTarget:
             raise ConfigurationError("at least one accelerator instance type is required")
         if len({item.name for item in self.instance_types}) != len(self.instance_types):
             raise ConfigurationError("accelerator instance types must be unique")
+        if self.acquisition_profile == "hyd-b300":
+            if tuple(regions) != ("ap-south-2",) or self.active_region != "ap-south-2":
+                raise ConfigurationError("hyd-b300 requires only active/candidate Region ap-south-2")
+            if tuple(item.name for item in self.instance_types) != ("p6-b300.48xlarge",):
+                raise ConfigurationError("hyd-b300 permits exactly p6-b300.48xlarge")
+            if self.region_selection.mode != "manual" or self.integration_mode != "standalone":
+                raise ConfigurationError("hyd-b300 requires manual Region selection and standalone integration")
+            if self.accelerator_profile != "gpu-production":
+                raise ConfigurationError("hyd-b300 requires gpu-production metadata verification")
+            if any(item.local_zone_placements for item in self.candidate_regions):
+                raise ConfigurationError("hyd-b300 does not permit Local Zone placements")
+            if any(not item.launch_template_version.isascii() or not item.launch_template_version.isdecimal()
+                   or int(item.launch_template_version) < 1 for item in self.candidate_regions):
+                raise ConfigurationError("hyd-b300 requires a pinned positive numeric Launch Template version, not $Latest/$Default")
+            if not isinstance(self.ownership_tags.get("customer-id"), str) or not self.ownership_tags["customer-id"].strip():
+                raise ConfigurationError("hyd-b300 requires ownership_tags customer-id")
+        if self.accelerator_profile == "cpu-validation":
+            if self.acquisition_profile != "generic":
+                raise ConfigurationError("cpu-validation requires acquisition_profile generic")
+            if len(regions) != 1 or self.region_selection.mode != "manual" or self.active_region != regions[0]:
+                raise ConfigurationError("cpu-validation requires exactly one manual active/candidate Region")
+            if self.integration_mode != "standalone" or self.desired_instance_count != 1 or self.maximum_instance_count != 1:
+                raise ConfigurationError("cpu-validation requires standalone integration and exactly one machine")
+            if tuple(item.name for item in self.instance_types) != ("c6i.large",):
+                raise ConfigurationError("cpu-validation permits exactly c6i.large")
+            if any(item.local_zone_placements for item in self.candidate_regions):
+                raise ConfigurationError("cpu-validation does not permit Local Zones")
+            if any(not re.fullmatch(r"[1-9][0-9]*", item.launch_template_version) for item in self.candidate_regions):
+                raise ConfigurationError("cpu-validation requires a pinned positive numeric Launch Template version")
+            if not isinstance(self.validation_run_id, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", self.validation_run_id):
+                raise ConfigurationError("cpu-validation requires a non-empty unique validation_run_id")
+            if self.ownership_tags.get("purpose") != "cpu-spot-validation" or self.ownership_tags.get("validation-run-id") != self.validation_run_id:
+                raise ConfigurationError("cpu-validation requires purpose cpu-spot-validation and matching validation-run-id tags")
+            if self.excess_instance_termination:
+                raise ConfigurationError("cpu-validation does not permit resize or surge")
+            if not self.validation_review_budget_usd.is_finite() or not Decimal("0") < self.validation_review_budget_usd <= Decimal("1.00"):
+                raise ConfigurationError("cpu-validation review budget must be positive and no more than USD 1.00")
+            if self.enabled or self.validation_started_at is not None or self.validation_expires_at is not None:
+                start = parse_validation_timestamp(self.validation_started_at)
+                expiry = parse_validation_timestamp(self.validation_expires_at)
+                if not timedelta(0) < expiry - start <= timedelta(minutes=30):
+                    raise ConfigurationError("cpu-validation requires a positive window of no more than 30 minutes")
+            for instance in self.instance_types:
+                if (instance.accelerator_model, instance.accelerator_count, instance.h100_gpu_count) != ("CPU", 0, 0):
+                    raise ConfigurationError("cpu-validation must report zero accelerators")
+                if instance.spot_price_cap_usd is None or not instance.spot_price_cap_usd.is_finite() or not Decimal("0") < instance.spot_price_cap_usd <= Decimal("0.10"):
+                    raise ConfigurationError("cpu-validation requires an explicit Spot cap no greater than USD 0.10/hour")
+        elif any(value is not None for value in (self.validation_run_id, self.validation_started_at, self.validation_expires_at)) or self.ownership_tags.get("purpose") == "cpu-spot-validation":
+            raise ConfigurationError("CPU validation identity cannot be used by GPU profiles")
         catalog = ACCELERATOR_CATALOG.get(self.accelerator_profile, {})
         for instance in self.instance_types:
             if not isinstance(instance.name, str) or not instance.name:
@@ -206,6 +285,24 @@ class CapacityTarget:
             raise ConfigurationError("ownership_tags cannot override reserved tags or contain empty keys/values")
 
 
+def parse_validation_timestamp(value: str | None) -> datetime:
+    """Require explicit UTC strings; never infer timezone or renew a deadline."""
+    if not isinstance(value, str):
+        raise ConfigurationError("validation timestamps must be explicit UTC ISO8601 strings")
+    try:
+        result = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as error:
+        raise ConfigurationError("validation timestamps must be explicit UTC ISO8601 strings") from error
+    if result.tzinfo is None or result.utcoffset() != timedelta(0):
+        raise ConfigurationError("validation timestamps must use UTC (Z or +00:00)")
+    return result.astimezone(timezone.utc)
+
+
+def _validation_timestamp(raw: dict[str, Any], key: str) -> str | None:
+    value = raw.get(key)
+    return None if value is None else parse_validation_timestamp(value).isoformat()
+
+
 def _missing_region(region: str) -> RegionInputs:
     raise ConfigurationError(f"no inputs configured for region {region}")
 
@@ -251,7 +348,7 @@ def target_from_mapping(raw: dict[str, Any]) -> CapacityTarget:
         types = []
         for item in raw["instance_types"]:
             expected_model, expected_count, expected_h100 = catalog.get(item["name"], ("unknown", 0, 0))
-            model = expected_model if accelerator_profile == "functional-validation" else "unknown"
+            model = expected_model if accelerator_profile in {"functional-validation", "cpu-validation"} else "unknown"
             types.append(InstanceType(
                 item["name"], Decimal(str(item["spot_price_cap_usd"])) if item.get("spot_price_cap_usd") is not None else None,
                 model,
@@ -271,11 +368,17 @@ def target_from_mapping(raw: dict[str, Any]) -> CapacityTarget:
             maximum_instance_count=_strict_int(raw, "maximum_instance_count", 1), active_region=raw.get("active_region"), candidate_regions=regions, instance_types=tuple(types),
             region_selection=selection,
             accelerator_profile=accelerator_profile,
+            acquisition_profile=raw.get("acquisition_profile", "generic"),
+            placement_strategy=raw.get("placement_strategy", "sequential"),
             integration_mode=raw.get("integration_mode", "standalone"), price_cap_source=raw.get("price_cap_source", "linux-ondemand"),
             zone_expansion_minutes=_strict_int(raw, "zone_expansion_minutes", 15),
             region_failover_minutes=_strict_int(raw, "region_failover_minutes", 30), failover_approval_minutes=_strict_int(raw, "failover_approval_minutes", 30),
             capacity_rebalancing=_strict_bool(raw, "capacity_rebalancing", False), excess_instance_termination=_strict_bool(raw, "excess_instance_termination", False),
             notification_topic_arn=raw.get("notification_topic_arn"), ownership_tags=dict(raw.get("ownership_tags", {})),
+            validation_run_id=raw.get("validation_run_id"),
+            validation_started_at=_validation_timestamp(raw, "validation_started_at"),
+            validation_expires_at=_validation_timestamp(raw, "validation_expires_at"),
+            validation_review_budget_usd=Decimal(str(raw.get("validation_review_budget_usd", "1.00"))),
         )
     except (KeyError, TypeError, ValueError, InvalidOperation) as error:
         raise ConfigurationError(f"invalid target configuration: {error}") from error

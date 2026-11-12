@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
+from threading import RLock
 from typing import Any, Protocol
 
 from .region_selection import RegionDecision, RegionSignalSnapshot
@@ -27,6 +28,14 @@ class VersionedState:
     initial_region_snapshot_id: str | None = None
     fleet_request_epoch: str | None = None
     owned_fleet_id: str | None = None
+    creation_request_json: str | None = None
+    creation_started_at: datetime | None = None
+    creation_configuration_version: int | None = None
+    creation_status: str | None = None
+    creation_error_codes: tuple[str, ...] = ()
+    validation_run_id: str | None = None
+    validation_started_at: str | None = None
+    validation_expires_at: str | None = None
 
     def as_item(self) -> dict[str, Any]:
         return {
@@ -39,26 +48,53 @@ class VersionedState:
             "initial_region_snapshot_id": self.initial_region_snapshot_id,
             "fleet_request_epoch": self.fleet_request_epoch,
             "owned_fleet_id": self.owned_fleet_id,
+            "creation_request_json": self.creation_request_json,
+            "creation_started_at": self.creation_started_at.isoformat() if self.creation_started_at else None,
+            "creation_configuration_version": self.creation_configuration_version,
+            "creation_status": self.creation_status,
+            "creation_error_codes": list(self.creation_error_codes),
+            "validation_run_id": self.validation_run_id,
+            "validation_started_at": self.validation_started_at,
+            "validation_expires_at": self.validation_expires_at,
         }
 
 
 class StateStore(Protocol):
     def get(self, target_id: str) -> VersionedState | None: ...
     def put_if_version(self, state: VersionedState, expected_version: int | None) -> None: ...
+    def acquire_writer(self, target_id: str, owner: str, now: datetime, lease_seconds: int = 180) -> bool: ...
+    def release_writer(self, target_id: str, owner: str) -> None: ...
 
 
 class InMemoryStateStore:
     def __init__(self) -> None:
         self.items: dict[str, VersionedState] = {}
+        self.writers: dict[str, tuple[str, float]] = {}
+        self._mutex = RLock()
 
     def put_if_version(self, state: VersionedState, expected_version: int | None) -> None:
-        current = self.items.get(state.target_id)
-        if (current is None and expected_version is not None) or (current is not None and current.version != expected_version):
-            raise StateConflict("state version changed")
-        self.items[state.target_id] = state
+        with self._mutex:
+            current = self.items.get(state.target_id)
+            if (current is None and expected_version is not None) or (current is not None and current.version != expected_version):
+                raise StateConflict("state version changed")
+            self.items[state.target_id] = state
 
     def get(self, target_id: str) -> VersionedState | None:
-        return self.items.get(target_id)
+        with self._mutex:
+            return self.items.get(target_id)
+
+    def acquire_writer(self, target_id: str, owner: str, now: datetime, lease_seconds: int = 180) -> bool:
+        with self._mutex:
+            claim = self.writers.get(target_id)
+            if claim is not None and claim[1] > now.timestamp():
+                return False
+            self.writers[target_id] = (owner, now.timestamp() + lease_seconds)
+            return True
+
+    def release_writer(self, target_id: str, owner: str) -> None:
+        with self._mutex:
+            if self.writers.get(target_id, (None,))[0] == owner:
+                self.writers.pop(target_id, None)
 
 
 class DynamoStateStore:
@@ -67,13 +103,10 @@ class DynamoStateStore:
 
     def put_if_version(self, state: VersionedState, expected_version: int | None) -> None:
         from botocore.exceptions import ClientError
-        expression = "attribute_not_exists(pk)" if expected_version is None else "version = :expected"
-        values = None if expected_version is None else {":expected": expected_version}
+        from boto3.dynamodb.conditions import Attr
+        condition = Attr("pk").not_exists() if expected_version is None else Attr("version").eq(expected_version)
         try:
-            kwargs: dict[str, Any] = {"Item": state.as_item(), "ConditionExpression": expression}
-            if values is not None:
-                kwargs["ExpressionAttributeValues"] = values
-            self.table.put_item(**kwargs)
+            self.table.put_item(Item=state.as_item(), ConditionExpression=condition)
         except ClientError as error:
             if error.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
                 raise StateConflict("state version changed") from error
@@ -94,7 +127,35 @@ class DynamoStateStore:
             int(item["initial_region_decision_version"]) if item.get("initial_region_decision_version") is not None else None,
             item.get("initial_region_snapshot_id"),
             item.get("fleet_request_epoch"), item.get("owned_fleet_id"),
+            item.get("creation_request_json"),
+            datetime.fromisoformat(item["creation_started_at"]) if item.get("creation_started_at") else None,
+            int(item["creation_configuration_version"]) if item.get("creation_configuration_version") is not None else None,
+            item.get("creation_status"), tuple(item.get("creation_error_codes", ())),
+            item.get("validation_run_id"), item.get("validation_started_at"), item.get("validation_expires_at"),
         )
+
+    def acquire_writer(self, target_id: str, owner: str, now: datetime, lease_seconds: int = 180) -> bool:
+        from boto3.dynamodb.conditions import Attr
+        epoch = int(now.timestamp())
+        try:
+            self.table.put_item(
+                Item={"pk": f"TARGET#{target_id}", "sk": "WRITER", "owner": owner,
+                      "lease_until": epoch + lease_seconds, "ttl": epoch + lease_seconds + 3600},
+                ConditionExpression=Attr("owner").not_exists() | Attr("lease_until").lte(epoch),
+            )
+        except self.table.meta.client.exceptions.ConditionalCheckFailedException:
+            return False
+        return True
+
+    def release_writer(self, target_id: str, owner: str) -> None:
+        from boto3.dynamodb.conditions import Attr
+        try:
+            self.table.delete_item(
+                Key={"pk": f"TARGET#{target_id}", "sk": "WRITER"},
+                ConditionExpression=Attr("owner").eq(owner),
+            )
+        except self.table.meta.client.exceptions.ConditionalCheckFailedException:
+            return
 
 
 class DynamoTargetStore:

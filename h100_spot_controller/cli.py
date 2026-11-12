@@ -2,29 +2,45 @@
 
 import argparse
 import json
+import sys
+from uuid import uuid4
 from dataclasses import asdict, replace
 from pathlib import Path
 
 from .config import ConfigurationError, load_target, load_target_mapping, target_from_mapping
 from .discovery import discover_region, ec2_client
-from .gpu import describe_gpu_instance_types
+from .gpu import describe_gpu_instance_types, describe_cpu_instance_types
 from .dryrun import integration_dry_run
 from .failover import DynamoFailoverApprovalStore, build_failover_plan, plan_as_dict, target_configuration_version, utc_now
-from .fleet import cleanup_owned_fleet, find_owned_fleet, find_owned_instances, fleet_request, observe_fleet_capacity, owned_capacity_inventory, terminate_owned_instances
+from .fleet import INACTIVE_FLEET_STATES, cleanup_owned_fleet, find_fleet_by_id, find_owned_fleet, find_owned_instances, fleet_request, is_owned_fleet, observe_fleet_capacity, owned_capacity_inventory, terminate_owned_instances
 from .launch_contract import inspect_launch_contract
 from .notifications import NotificationDeduplicator, failover_event_notifier
 from .placement import initial_placement
 from .pricing import ondemand_caps
 from .state import DynamoStateStore, DynamoTargetStore, restore_config_numbers
+from .sdk import client_config
+
+
+def _state_region(args, target=None):
+    region = getattr(args, "state_region", None)
+    if target is not None and target.acquisition_profile == "hyd-b300":
+        if region not in {None, "ap-south-2"}:
+            raise ConfigurationError("HYD B300 state table must be in ap-south-2")
+        return "ap-south-2"
+    if target is not None and target.accelerator_profile == "cpu-validation":
+        if region not in {None, target.active_region}:
+            raise ConfigurationError("CPU validation state table must be in its one approved Region")
+        return target.active_region
+    return region
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(prog="h100-spot-controller")
     commands = parser.add_subparsers(dest="command", required=True)
-    for name in ("validate-target", "dry-run"):
+    for name in ("validate-target", "dry-run", "preflight"):
         command = commands.add_parser(name)
         command.add_argument("path", type=Path)
-        if name == "dry-run":
+        if name in {"dry-run", "preflight"}:
             command.add_argument("--profile", default="default")
     discover = commands.add_parser("discover", help="read-only AZ and offering discovery")
     discover.add_argument("path", type=Path)
@@ -64,36 +80,44 @@ def main() -> int:
         command.add_argument("--profile", default="default")
         if name != "failover-review":
             command.add_argument("--execute", action="store_true", help="required acknowledgement before the DynamoDB write")
+    for name in ("capacity-review", "cleanup", "target-review", "target-put", "failover-request",
+                 "failover-review", "failover-approve", "failover-reject"):
+        commands.choices[name].add_argument("--state-region", help="explicit Region of the controller DynamoDB table (HYD targets always ap-south-2)")
     args = parser.parse_args()
     if args.command == "target-review":
         import boto3
         session = boto3.Session(profile_name=args.profile)
-        table = session.resource("dynamodb").Table(args.table)
+        table = session.resource("dynamodb", region_name=_state_region(args), config=client_config()).Table(args.table)
         item = table.get_item(Key={"pk": f"TARGET#{args.target_id}", "sk": "CONFIG"}, ConsistentRead=True).get("Item")
         if item is None:
             parser.error("persisted target configuration not found")
         raw_config = restore_config_numbers(item["config"])
         target = target_from_mapping(raw_config)
         gpu_metadata = {}
-        if target.accelerator_profile != "functional-validation":
+        cpu_metadata = {}
+        if target.accelerator_profile == "cpu-validation":
+            cpu_metadata = {inputs.region: describe_cpu_instance_types(session.client("ec2", region_name=inputs.region), ("c6i.large",)) for inputs in target.candidate_regions}
+        elif target.accelerator_profile != "functional-validation":
             gpu_metadata = {
                 inputs.region: {name: descriptor.as_dict() for name, descriptor in describe_gpu_instance_types(
                     session.client("ec2", region_name=inputs.region), tuple(entry.name for entry in target.instance_types),
                 ).items()}
                 for inputs in target.candidate_regions
             }
-        print(json.dumps({"target_id": args.target_id, "configuration_version": int(item["configuration_version"]), "config": raw_config, "gpu_metadata": gpu_metadata, "aws_write": False}, default=str))
+        print(json.dumps({"target_id": args.target_id, "configuration_version": int(item["configuration_version"]), "config": raw_config, "gpu_metadata": gpu_metadata, "cpu_metadata": cpu_metadata, "aws_write": False}, default=str))
         return 0
     if args.command == "failover-request":
         import boto3
         try:
             session = boto3.Session(profile_name=args.profile)
-            dynamodb = session.resource("dynamodb")
+            dynamodb = session.resource("dynamodb", region_name=_state_region(args), config=client_config())
             table = dynamodb.Table(args.table)
             raw_target = DynamoTargetStore(args.table, dynamodb).get_mapping(args.target_id)
             if raw_target is None:
                 raise ValueError("persisted target configuration not found")
             target = target_from_mapping(raw_target)
+            if target.accelerator_profile == "cpu-validation":
+                raise ValueError("CPU validation prohibits failover")
             if not target.enabled:
                 raise ValueError("manual failover requires an enabled target")
             state = DynamoStateStore(args.table, dynamodb).get(target.target_id)
@@ -163,7 +187,7 @@ def main() -> int:
         import boto3
         try:
             session = boto3.Session(profile_name=args.profile)
-            dynamodb = session.resource("dynamodb")
+            dynamodb = session.resource("dynamodb", region_name=_state_region(args), config=client_config())
             table = dynamodb.Table(args.table)
             store = DynamoFailoverApprovalStore(table)
             plan = store.get_plan(args.target_id, args.plan_id)
@@ -174,6 +198,8 @@ def main() -> int:
             if raw_target is None:
                 raise ValueError("persisted target configuration not found")
             target = target_from_mapping(raw_target)
+            if target.accelerator_profile == "cpu-validation":
+                raise ValueError("CPU validation prohibits failover decisions")
             notifier = failover_event_notifier(
                 session.client("sns"), plan.notification_topic_arn or target.notification_topic_arn,
                 NotificationDeduplicator(table),
@@ -193,6 +219,7 @@ def main() -> int:
         return 0
     try:
         target = load_target(args.path)
+        _state_region(args, target)
     except (ConfigurationError, RuntimeError) as error:
         parser.error(str(error))
     payload = {"target_id": target.target_id, "aws_write": False}
@@ -201,7 +228,7 @@ def main() -> int:
         session = boto3.Session(profile_name=args.profile)
         active_region = target.active_region
         if args.table:
-            state = DynamoStateStore(args.table, session.resource("dynamodb")).get(target.target_id)
+            state = DynamoStateStore(args.table, session.resource("dynamodb", region_name=_state_region(args, target), config=client_config())).get(target.target_id)
             if state is not None:
                 active_region = state.active_region
         clients = {inputs.region: session.client("ec2", region_name=inputs.region) for inputs in target.candidate_regions}
@@ -212,27 +239,57 @@ def main() -> int:
     elif args.command == "cleanup":
         if target.enabled:
             parser.error("cleanup requires a reviewed target with enabled: false")
-        if args.table:
-            import boto3
-            dynamodb = boto3.Session(profile_name=args.profile).resource("dynamodb")
-            state = DynamoStateStore(args.table, dynamodb).get(target.target_id)
-            if state is not None:
-                target = replace(target, active_region=state.active_region)
-        client = ec2_client(args.profile, target.active_region)
-        fleet = find_owned_fleet(client, target)
-        instances = find_owned_instances(client, target)
-        payload.update(
-            active_region=target.active_region,
-            owned_fleet_id=fleet.get("FleetId") if fleet else None,
-            owned_instance_ids=[instance["InstanceId"] for instance in instances],
-            terminate_instances=bool(args.terminate_instances),
-        )
         if args.terminate_instances and not args.execute:
             parser.error("--terminate-instances requires --execute")
-        if args.execute:
-            cleanup_owned_fleet(client, target, fleet, explicitly_authorized=True, terminate_instances=False)
-            terminated = terminate_owned_instances(client, target, instances, explicitly_authorized=args.terminate_instances)
-            payload.update(aws_write=True, fleet_cancelled=fleet is not None, terminated_instance_ids=list(terminated))
+        if target.acquisition_profile == "hyd-b300" and args.execute and not args.table:
+            parser.error("HYD cleanup --execute requires --table to verify disabled persisted configuration and creation intent")
+        writers = None
+        owner = uuid4().hex
+        if args.table:
+            import boto3
+            dynamodb = boto3.Session(profile_name=args.profile).resource("dynamodb", region_name=_state_region(args, target), config=client_config())
+            writers = DynamoStateStore(args.table, dynamodb)
+            if args.execute and not writers.acquire_writer(target.target_id, owner, utc_now()):
+                parser.error("target has an active writer; wait for it to settle before cleanup")
+        try:
+            state = writers.get(target.target_id) if writers is not None else None
+            if state is not None:
+                target = replace(target, active_region=state.active_region)
+            if args.execute and writers is not None:
+                persisted = DynamoTargetStore(args.table, dynamodb).get_mapping(target.target_id)
+                if persisted is None and target.acquisition_profile == "hyd-b300":
+                    parser.error("HYD persisted configuration is missing; resolve ownership before cleanup")
+                if persisted is not None:
+                    persisted_target = target_from_mapping(persisted)
+                    if persisted_target.tags != target.tags:
+                        parser.error("reviewed cleanup ownership does not match persisted customer/target")
+                    if persisted_target.enabled:
+                        parser.error("persist enabled:false before cleanup; otherwise the controller may recreate demand")
+            client = ec2_client(args.profile, target.active_region)
+            fleet = find_owned_fleet(client, target)
+            if fleet is None and state is not None and state.owned_fleet_id:
+                known = find_fleet_by_id(client, state.owned_fleet_id)
+                if known is None:
+                    parser.error("recorded Fleet is not visible; absence does not prove cancellation")
+                if not is_owned_fleet(known, target):
+                    parser.error("recorded Fleet ownership does not match reviewed cleanup target")
+                if known.get("FleetState", known.get("State")) not in INACTIVE_FLEET_STATES:
+                    fleet = known
+            if args.execute and fleet is None and state is not None and state.creation_request_json and not state.owned_fleet_id:
+                parser.error("creation outcome is unresolved; do not erase its intent or assume there is no demand")
+            instances = find_owned_instances(client, target)
+            payload.update(active_region=target.active_region,
+                           owned_fleet_id=fleet.get("FleetId") if fleet else None,
+                           owned_instance_ids=[instance["InstanceId"] for instance in instances],
+                           terminate_instances=bool(args.terminate_instances))
+            if args.execute:
+                cancelled = cleanup_owned_fleet(client, target, fleet, explicitly_authorized=True, terminate_instances=False)
+                terminated = terminate_owned_instances(client, target, instances, explicitly_authorized=args.terminate_instances)
+                payload.update(aws_write=cancelled or bool(terminated), fleet_cancelled=cancelled,
+                               terminated_instance_ids=list(terminated))
+        finally:
+            if args.execute and writers is not None:
+                writers.release_writer(target.target_id, owner)
     elif args.command == "target-put":
         if not args.execute:
             parser.error("target-put is a DynamoDB write; repeat with --execute after review")
@@ -242,11 +299,14 @@ def main() -> int:
         session = boto3.Session(profile_name=args.profile)
         if target.accelerator_profile != "functional-validation":
             for inputs in target.candidate_regions:
-                describe_gpu_instance_types(
+                describe_metadata = describe_cpu_instance_types if target.accelerator_profile == "cpu-validation" else describe_gpu_instance_types
+                describe_metadata(
                     session.client("ec2", region_name=inputs.region),
                     tuple(item.name for item in target.instance_types),
                 )
         raw = load_target_mapping(args.path)
+        if target_from_mapping(raw) != target:
+            parser.error("target file changed during validation; review and rerun before any configuration write")
         version = target_configuration_version(target)
         kwargs = {
             "Item": {"pk": f"TARGET#{target.target_id}", "sk": "CONFIG", "configuration_version": version, "config": raw},
@@ -254,22 +314,47 @@ def main() -> int:
         }
         if args.expected_version is not None:
             kwargs["ExpressionAttributeValues"] = {":expected": args.expected_version}
+        dynamodb = session.resource("dynamodb", region_name=_state_region(args, target), config=client_config())
+        writers = DynamoStateStore(args.table, dynamodb)
+        owner = uuid4().hex
+        if not writers.acquire_writer(target.target_id, owner, utc_now()):
+            parser.error("target has an active capacity writer; retry the reviewed update after it settles")
         try:
-            session.resource("dynamodb").Table(args.table).put_item(**kwargs)
+            if target.accelerator_profile == "cpu-validation":
+                window = target.validation_window_status(utc_now())
+                if window:
+                    parser.error("CPU target cannot be enabled outside its approved window")
+                previous = DynamoTargetStore(args.table, dynamodb).get_mapping(target.target_id)
+                state = writers.get(target.target_id)
+                identity = (target.validation_run_id, target.validation_started_at, target.validation_expires_at)
+                if previous is not None:
+                    saved = target_from_mapping(previous)
+                    saved_identity = (saved.validation_run_id, saved.validation_started_at, saved.validation_expires_at)
+                    if saved.validation_started_at is not None and saved_identity != identity:
+                        parser.error("CPU validation run/start/expiry are immutable; use a new isolated target/run")
+                if state is not None and state.validation_run_id is not None and identity != (state.validation_run_id, state.validation_started_at, state.validation_expires_at):
+                    parser.error("CPU validation identity differs from pinned runtime state")
+            dynamodb.Table(args.table).put_item(**kwargs)
         except Exception as error:
             if getattr(error, "response", {}).get("Error", {}).get("Code") == "ConditionalCheckFailedException":
                 parser.error("target configuration changed or already exists; run target-review and supply its --expected-version")
             raise
+        finally:
+            writers.release_writer(target.target_id, owner)
         payload.update(aws_write=True, configuration_version=version, enabled=target.enabled)
     elif args.command == "validate-target":
-        payload.update(valid=True, enabled=target.enabled)
-    elif args.command == "dry-run":
+        payload.update(valid=True, enabled=target.enabled, accelerator_profile=target.accelerator_profile, acquisition_profile=target.acquisition_profile,
+                       active_region=target.active_region, instance_types=[item.name for item in target.instance_types])
+    elif args.command in {"dry-run", "preflight"}:
         import boto3
         session = boto3.Session(profile_name=args.profile)
-        clients = {item.region: session.client("ec2", region_name=item.region) for item in target.candidate_regions}
-        quota_clients = {item.region: session.client("service-quotas", region_name=item.region) for item in target.candidate_regions}
+        if args.command == "preflight" and target.acquisition_profile != "hyd-b300" and target.accelerator_profile != "cpu-validation":
+            parser.error("preflight requires HYD B300 or CPU validation; use dry-run for other generic targets")
+        config = client_config()
+        clients = {item.region: session.client("ec2", region_name=item.region, config=config) for item in target.candidate_regions}
+        quota_clients = {item.region: session.client("service-quotas", region_name=item.region, config=config) for item in target.candidate_regions}
         payload = integration_dry_run(
-            target, clients, session.client("pricing", region_name="us-east-1"), utc_now(), quota_clients,
+            target, clients, session.client("pricing", region_name="us-east-1", config=config), utc_now(), quota_clients,
         )
     else:
         regions = []
@@ -281,9 +366,16 @@ def main() -> int:
             )
             gpu_metadata = (
                 {name: descriptor.as_dict() for name, descriptor in describe_gpu_instance_types(client, tuple(item.name for item in target.instance_types)).items()}
-                if target.accelerator_profile != "functional-validation" else {}
+                if target.accelerator_profile not in {"functional-validation", "cpu-validation"} else {}
             )
-            regions.append({"region": discovery.region, "zones": [item.__dict__ for item in discovery.zones], "offerings": discovery.offered_instance_types_by_zone, "gpu_metadata": gpu_metadata})
+            cpu_metadata = describe_cpu_instance_types(client, ("c6i.large",)) if target.accelerator_profile == "cpu-validation" else {}
+            regions.append({"cpu_metadata": cpu_metadata, "region": discovery.region, "zones": [item.__dict__ for item in discovery.zones], "offerings": discovery.offered_instance_types_by_zone, "gpu_metadata": gpu_metadata})
         payload.update(regions=regions)
     print(json.dumps(payload, default=str))
+    if args.command in {"preflight", "dry-run"} and (target.acquisition_profile == "hyd-b300" or target.accelerator_profile == "cpu-validation"):
+        return 0 if payload.get("preflight", {}).get("ready", False) else 2
     return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -12,7 +12,7 @@ from typing import Any
 from .config import ConfigurationError, target_from_mapping
 from .discovery import discover_region
 from .gpu import describe_gpu_instance_types, target_with_gpu_metadata
-from .fleet import find_owned_fleet, find_owned_instances, observe_fleet_capacity, owned_capacity_inventory
+from .fleet import FleetOwnershipError, find_owned_fleet, find_owned_instances, observe_fleet_capacity, owned_capacity_inventory
 from .failover import DynamoFailoverApprovalStore, build_failover_plan, execute_approved_failover, target_configuration_version
 from .metrics import NAMESPACE, eks_readiness_metric_data, operational_metric_data, publish_metrics, publish_signal_metrics, region_selection_metric_data, zone_metric_data
 from .launch_contract import inspect_launch_contract
@@ -20,6 +20,8 @@ from .notifications import NotificationDeduplicator, failover_event_notifier, pu
 from .outcomes import classify_api_error
 from .reconciliation import reconcile_target
 from .pricing import ondemand_caps
+from .preflight import collect_hyd_preflight
+from .sdk import client_config
 from .signals import CandidateSignalSnapshot, collect_spot_prices, collect_sps_regions
 from .region_selection import (
     build_signal_snapshot, collect_regional_readiness, decision_from_selection,
@@ -34,6 +36,32 @@ from .state import (
 LOGGER = logging.getLogger(__name__)
 
 
+class _CapacityClient:
+    """Record attempted mutations, including calls whose service result is unknown."""
+
+    def __init__(self, client, region, writes):
+        self.client, self.region, self.writes = client, region, writes
+
+    def __getattr__(self, name):
+        method = getattr(self.client, name)
+        if name not in {"create_fleet", "modify_fleet", "delete_fleets", "terminate_instances"}:
+            return method
+
+        def invoke(**kwargs):
+            evidence = {"region": self.region, "operation": name, "status": "uncertain"}
+            self.writes.append(evidence)
+            result = method(**kwargs)
+            evidence["status"] = "returned"
+            return result
+
+        return invoke
+
+
+def _write_evidence(writes):
+    return {"aws_write": None if any(item["status"] == "uncertain" for item in writes) else bool(writes),
+            "capacity_write_attempted": bool(writes), "capacity_writes": writes}
+
+
 def _target_from_event(event: dict[str, Any], target_store: Any = None):
     raw = event.get("target")
     if not isinstance(raw, dict) and target_store is not None and event.get("target_id"):
@@ -42,7 +70,18 @@ def _target_from_event(event: dict[str, Any], target_store: Any = None):
             raise ConfigurationError(f"persisted target configuration not found: {event['target_id']}")
     if not isinstance(raw, dict):
         raise ConfigurationError("event must contain target_id for a persisted target or an explicit target mapping")
-    return target_from_mapping(raw)
+    target = target_from_mapping(raw)
+    customer = os.environ.get("CUSTOMER_ID")
+    deployment_target = os.environ.get("TARGET_ID")
+    if customer and (target.ownership_tags.get("customer-id") != customer or target.target_id != deployment_target):
+        raise ConfigurationError("target/customer identity does not match the deployed control plane")
+    if target.accelerator_profile == "cpu-validation" and os.environ.get("STATE_TABLE_NAME"):
+        deployment_run = os.environ.get("VALIDATION_RUN_ID")
+        if not deployment_target or not deployment_run or target.target_id != deployment_target or target.validation_run_id != deployment_run:
+            raise ConfigurationError("CPU target/run identity does not match the isolated deployed control plane")
+    if target.enabled and target.acquisition_profile == "hyd-b300" and not customer:
+        raise ConfigurationError("enabled HYD B300 runtime requires a customer-scoped deployment")
+    return target
 
 
 def _event_target_id(event: dict[str, Any]) -> str | None:
@@ -52,18 +91,19 @@ def _event_target_id(event: dict[str, Any]) -> str | None:
 def _clients(target: Any) -> tuple[dict[str, Any], Any, Any, Any, Any, Any, Any, Any, Any, dict[str, Any]]:
     import boto3
     session = boto3.Session()
-    by_region = {region.region: session.client("ec2", region_name=region.region) for region in target.candidate_regions}
+    config = client_config()
+    by_region = {region.region: session.client("ec2", region_name=region.region, config=config) for region in target.candidate_regions}
     table_name = os.environ["STATE_TABLE_NAME"]
-    dynamodb = session.resource("dynamodb")
+    dynamodb = session.resource("dynamodb", config=client_config())
     table = dynamodb.Table(table_name)
     quota_by_region = {
-        region.region: session.client("service-quotas", region_name=region.region)
+        region.region: session.client("service-quotas", region_name=region.region, config=config)
         for region in target.candidate_regions
     }
     return (
         by_region, DynamoStateStore(table_name, dynamodb),
-        session.client("pricing", region_name="us-east-1"), session.client("cloudwatch"),
-        session.client("sns"), table, DynamoEksReadinessStore(table_name, dynamodb),
+        session.client("pricing", region_name="us-east-1", config=config), session.client("cloudwatch", config=config),
+        session.client("sns", config=config), table, DynamoEksReadinessStore(table_name, dynamodb),
         DynamoRegionSignalStore(table_name, dynamodb),
         DynamoRegionDecisionStore(table_name, dynamodb), quota_by_region,
     )
@@ -88,26 +128,35 @@ def _with_eligible_local_zones(target: Any, state: Any, ec2: Any) -> Any:
     return replace(target, candidate_regions=tuple(filtered if item.region == filtered.region else item for item in target.candidate_regions))
 
 
-def reconcile(event: dict[str, Any], context: object, *, clients: dict[str, Any] | None = None, store: Any = None, pricing: Any = None, target_store: Any = None, cloudwatch: Any = None, sns: Any = None, deduplicator: Any = None, eks_readiness_store: Any = None, failover_store: Any = None, decision_store: Any = None) -> dict[str, Any]:
+def reconcile(event: dict[str, Any], context: object, *, clients: dict[str, Any] | None = None, store: Any = None, pricing: Any = None, target_store: Any = None, cloudwatch: Any = None, sns: Any = None, deduplicator: Any = None, eks_readiness_store: Any = None, failover_store: Any = None, decision_store: Any = None, quota_clients: dict[str, Any] | None = None) -> dict[str, Any]:
     """Reconcile only an event-supplied target; no implicit default target exists."""
     target = None
     table = None
+    capacity_writes = []
     try:
         event_target_id = _event_target_id(event)
-        if target_store is None and event_target_id:
+        if target_store is None and event_target_id and not isinstance(event.get("target"), dict):
             import boto3
             session = boto3.Session()
-            target_store = DynamoTargetStore(os.environ["STATE_TABLE_NAME"], session.resource("dynamodb"))
+            target_store = DynamoTargetStore(os.environ["STATE_TABLE_NAME"], session.resource("dynamodb", config=client_config()))
         if event_target_id and "target_id" not in event:
             event = {**event, "target_id": event_target_id}
         target = _target_from_event(event, target_store)
         if clients is None or store is None or pricing is None:
-            clients, store, pricing, default_cloudwatch, default_sns, table, default_eks_readiness, _, default_decisions, _ = _clients(target)
+            clients, store, pricing, default_cloudwatch, default_sns, table, default_eks_readiness, _, default_decisions, default_quotas = _clients(target)
+            quota_clients = quota_clients or default_quotas
             cloudwatch = cloudwatch or default_cloudwatch
             sns = sns or default_sns
             deduplicator = deduplicator or NotificationDeduplicator(table)
             eks_readiness_store = eks_readiness_store or default_eks_readiness
             decision_store = decision_store or default_decisions
+        if target_store is None and table is not None:
+            # Explicit payloads are useful for tests/review, but deployed writers
+            # must still match the currently persisted approved configuration.
+            import boto3
+            target_store = DynamoTargetStore(os.environ["STATE_TABLE_NAME"],
+                                            boto3.Session().resource("dynamodb", config=client_config()))
+        clients = {region: _CapacityClient(client, region, capacity_writes) for region, client in clients.items()}
         previous_state = store.get(target.target_id)
         now = utc_now()
         selection_configuration_version = target_configuration_version(target)
@@ -128,7 +177,13 @@ def reconcile(event: dict[str, Any], context: object, *, clients: dict[str, Any]
                 "recommended_region": decision.selected_region if decision else None,
             }
         target = replace(target, active_region=resolution.region)
-        if target.enabled:
+        window = target.validation_window_status(now)
+        if window:
+            # Pin even a first expired observation; otherwise a handler-only run
+            # could be renewed after returning without any durable deadline.
+            outcome = reconcile_target(clients[target.active_region], target, store, now)
+            return {"status": outcome.kind, **_write_evidence(capacity_writes), "outcome": asdict(outcome)}
+        if target.enabled and target.accelerator_profile != "cpu-validation":
             target, _ = target_with_gpu_metadata(target, clients[target.active_region])
         if previous_state is None and resolution.apply_decision:
             initial_state = VersionedState(
@@ -160,7 +215,18 @@ def reconcile(event: dict[str, Any], context: object, *, clients: dict[str, Any]
                 or (decision.applied_at is None and not decision_store.mark_applied(decision, now))
             ):
                 return {"status": "region_decision_conflict", "aws_write": False}
-        if target.enabled:
+        if target.enabled and target.acquisition_profile == "hyd-b300":
+            evidence = collect_hyd_preflight(target, clients[target.active_region],
+                                             (quota_clients or {}).get(target.active_region), pricing)
+            if not evidence["ready"]:
+                if sns is not None and deduplicator is not None:
+                    try:
+                        publish_controller_event(sns, target.notification_topic_arn or os.environ.get("NOTIFICATION_TOPIC_ARN"),
+                                                 deduplicator, target.target_id, "preflight_blocked", evidence, now)
+                    except Exception as error:
+                        evidence["notification_error"] = classify_api_error(error)[1]
+                return {"status": "preflight_blocked", "aws_write": False, "preflight": evidence}
+        if target.enabled and target.accelerator_profile != "cpu-validation":
             for inputs in target.candidate_regions:
                 if target.accelerator_profile != "functional-validation" and hasattr(clients[inputs.region], "describe_instance_types"):
                     describe_gpu_instance_types(clients[inputs.region], tuple(item.name for item in target.instance_types))
@@ -168,7 +234,7 @@ def reconcile(event: dict[str, Any], context: object, *, clients: dict[str, Any]
                 if not inspection.valid:
                     raise ConfigurationError(f"launch contract invalid in {inputs.region}: {', '.join(inspection.violations)}")
         target = _with_eligible_local_zones(target, previous_state, clients[target.active_region])
-        caps = ondemand_caps(pricing, target.active_region, tuple(item.name for item in target.instance_types))
+        caps = ondemand_caps(pricing, target.active_region, tuple(item.name for item in target.instance_types)) if target.enabled and target.accelerator_profile != "cpu-validation" else {}
         fleet = find_owned_fleet(clients[target.active_region], target)
         capacity = observe_fleet_capacity(clients[target.active_region], fleet, target) if fleet else None
         topic_arn = target.notification_topic_arn or os.environ.get("NOTIFICATION_TOPIC_ARN")
@@ -183,7 +249,7 @@ def reconcile(event: dict[str, Any], context: object, *, clients: dict[str, Any]
         state = previous_state
         manual_plan = None
         approval = None
-        if target.enabled and failover_store is not None and hasattr(failover_store, "get_current_plan"):
+        if target.enabled and target.accelerator_profile != "cpu-validation" and target.acquisition_profile != "hyd-b300" and failover_store is not None and hasattr(failover_store, "get_current_plan"):
             manual_plan = failover_store.get_current_plan(target.target_id)
             if manual_plan is not None:
                 approval = failover_store.get_approval(manual_plan)
@@ -194,7 +260,8 @@ def reconcile(event: dict[str, Any], context: object, *, clients: dict[str, Any]
                 if not claimed:
                     manual_plan = None
         failover_ready = (
-            target.enabled and state is not None and state.all_zones_shortfall_since is not None
+            target.enabled and target.accelerator_profile != "cpu-validation" and len(target.candidate_regions) > 1 and target.acquisition_profile != "hyd-b300"
+            and state is not None and state.all_zones_shortfall_since is not None
             and now >= state.all_zones_shortfall_since + timedelta(minutes=target.region_failover_minutes)
             and failover_store is not None and manual_plan is None
         )
@@ -297,14 +364,20 @@ def reconcile(event: dict[str, Any], context: object, *, clients: dict[str, Any]
             if outcome.kind == "failover_complete" and hasattr(failover_store, "clear_current_plan"):
                 failover_store.clear_current_plan(plan)
         else:
-            outcome = reconcile_target(clients[target.active_region], target, store, now, caps)
+            def current_configuration_matches():
+                current = target_store.get_mapping(target.target_id)
+                return current is not None and target_configuration_version(target_from_mapping(current)) == selection_configuration_version
+
+            outcome = reconcile_target(clients[target.active_region], target, store, now, caps,
+                                       configuration_guard=current_configuration_matches if target_store is not None else None,
+                                       pricing=pricing, quota_client=(quota_clients or {}).get(target.active_region))
             if plan is not None:
                 outcome = replace(outcome, kind="failover_rejected" if plan_rejected else "awaiting_approval")
 
         fleet = find_owned_fleet(clients[target.active_region], target)
         capacity = observe_fleet_capacity(clients[target.active_region], fleet, target) if fleet else None
         state = store.get(target.target_id)
-        if state is not None and state.pending_failover_completion_plan_id and fleet is not None and failover_store is not None:
+        if target.accelerator_profile != "cpu-validation" and state is not None and state.pending_failover_completion_plan_id and fleet is not None and failover_store is not None:
             pending_plan = failover_store.get_plan(target.target_id, state.pending_failover_completion_plan_id)
             if notifier is not None:
                 notifier("failover_completed", pending_plan, now)
@@ -336,13 +409,16 @@ def reconcile(event: dict[str, Any], context: object, *, clients: dict[str, Any]
                 state.shortfall_since, target.zone_expansion_minutes, now,
             ):
                 publish_controller_event(sns, topic_arn, deduplicator, target.target_id, "prolonged_shortfall", asdict(outcome), now)
-            elif outcome.kind in {"configuration_error", "authorization_error", "dependency_error", "ownership_mismatch"}:
+            elif outcome.kind in {"configuration_error", "authorization_error", "dependency_error", "ownership_mismatch",
+                                  "quota_error", "orphaned_capacity", "creation_conflict", "invalid_fleet"}:
                 publish_controller_event(sns, topic_arn, deduplicator, target.target_id, "repeated_reconciliation_failure", asdict(outcome), now)
             if previous_state and state and len(state.active_zone_ids) > len(previous_state.active_zone_ids):
                 publish_controller_event(sns, topic_arn, deduplicator, target.target_id, "zone_expansion", {"active_zone_ids": state.active_zone_ids}, now)
-        return {"status": outcome.kind, "aws_write": target.enabled, "outcome": asdict(outcome)}
+        return {"status": outcome.kind, **_write_evidence(capacity_writes), "outcome": asdict(outcome)}
+    except FleetOwnershipError as error:
+        return {"status": "ownership_mismatch", **_write_evidence(capacity_writes), "error": str(error)}
     except ConfigurationError as error:
-        return {"status": "configuration_error", "aws_write": False, "error": str(error)}
+        return {"status": "configuration_error", **_write_evidence(capacity_writes), "error": str(error)}
     except Exception as error:
         kind, code = classify_api_error(error)
         if target is not None and sns is not None and deduplicator is not None and kind != "rate_limited":
@@ -354,17 +430,17 @@ def reconcile(event: dict[str, Any], context: object, *, clients: dict[str, Any]
                 )
             except Exception:
                 pass
-        return {"status": kind, "aws_write": False, "error_code": code}
+        return {"status": kind, **_write_evidence(capacity_writes), "error_code": code}
 
 
 def collect(event: dict[str, Any], context: object, *, clients: dict[str, Any] | None = None, target_store: Any = None, cloudwatch: Any = None, pricing: Any = None, quota_clients: dict[str, Any] | None = None, signal_store: Any = None, decision_store: Any = None) -> dict[str, Any]:
     """Collect advisory capacity signals; it never changes Fleet capacity."""
     try:
         event_target_id = _event_target_id(event)
-        if target_store is None and event_target_id:
+        if target_store is None and event_target_id and not isinstance(event.get("target"), dict):
             import boto3
             session = boto3.Session()
-            target_store = DynamoTargetStore(os.environ["STATE_TABLE_NAME"], session.resource("dynamodb"))
+            target_store = DynamoTargetStore(os.environ["STATE_TABLE_NAME"], session.resource("dynamodb", config=client_config()))
         if event_target_id and "target_id" not in event:
             event = {**event, "target_id": event_target_id}
         target = _target_from_event(event, target_store)
@@ -448,6 +524,8 @@ def collect(event: dict[str, Any], context: object, *, clients: dict[str, Any] |
             "prices": {region: observation.status for region, observation in snapshot.price_by_region.items()},
             "region_selection": selection_report,
         }
+    except FleetOwnershipError as error:
+        return {"status": "ownership_mismatch", "aws_write": False, "error": str(error)}
     except ConfigurationError as error:
         return {"status": "configuration_error", "aws_write": False, "error": str(error)}
     except Exception as error:
@@ -464,7 +542,7 @@ def spot_event(event: dict[str, Any], context: object, *, clients: dict[str, Any
         if target_store is None:
             import boto3
             session = boto3.Session()
-            target_store = DynamoTargetStore(os.environ["STATE_TABLE_NAME"], session.resource("dynamodb"))
+            target_store = DynamoTargetStore(os.environ["STATE_TABLE_NAME"], session.resource("dynamodb", config=client_config()))
         target = _target_from_event({"target_id": target_id}, target_store)
         if clients is None:
             clients, _, _, default_cloudwatch, default_sns, table, _, _, _, _ = _clients(target)
@@ -474,7 +552,10 @@ def spot_event(event: dict[str, Any], context: object, *, clients: dict[str, Any
         instance_id = event.get("detail", {}).get("instance-id")
         if not instance_id:
             raise ConfigurationError("spot event has no instance-id")
-        response = clients[target.active_region].describe_instances(InstanceIds=[instance_id])
+        event_region = event.get("region") or target.active_region
+        if event_region not in {item.region for item in target.candidate_regions}:
+            return {"status": "ignored_unapproved_region", "aws_write": False}
+        response = clients[event_region].describe_instances(InstanceIds=[instance_id])
         instances = [item for reservation in response.get("Reservations", []) for item in reservation.get("Instances", [])]
         tags = {tag["Key"]: tag["Value"] for tag in (instances[0].get("Tags", []) if instances else [])}
         if not instances or not all(tags.get(key) == value for key, value in target.tags.items()):
@@ -482,11 +563,13 @@ def spot_event(event: dict[str, Any], context: object, *, clients: dict[str, Any
         detail_type = event.get("detail-type", "")
         event_type = "spot_interruption" if "Interruption" in detail_type else "capacity_rebalance"
         if cloudwatch is not None:
-            cloudwatch.put_metric_data(Namespace=NAMESPACE, MetricData=operational_metric_data(target.target_id, target.active_region, "active", 0, 1 if event_type == "spot_interruption" else 0))
+            cloudwatch.put_metric_data(Namespace=NAMESPACE, MetricData=operational_metric_data(target.target_id, event_region, "active", 0, 1 if event_type == "spot_interruption" else 0))
         if sns is not None and deduplicator is not None:
             topic_arn = target.notification_topic_arn or os.environ.get("NOTIFICATION_TOPIC_ARN")
-            publish_controller_event(sns, topic_arn, deduplicator, target.target_id, event_type, {"instance_id": instance_id, "detail_type": detail_type}, utc_now())
+            publish_controller_event(sns, topic_arn, deduplicator, target.target_id, event_type, {"instance_id": instance_id, "region": event_region, "detail_type": detail_type}, utc_now())
         return {"status": event_type, "aws_write": False, "instance_id": instance_id}
+    except FleetOwnershipError as error:
+        return {"status": "ownership_mismatch", "aws_write": False, "error": str(error)}
     except ConfigurationError as error:
         return {"status": "configuration_error", "aws_write": False, "error": str(error)}
     except Exception as error:

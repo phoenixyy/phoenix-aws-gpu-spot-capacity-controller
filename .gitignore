@@ -1,6 +1,7 @@
 __pycache__/
 *.py[cod]
 .venv/
+.cpu-validation-work/
 cdk.out/
 cdk.out.*/
 *.egg-info/
@@ -10,11 +11,24 @@ coverage.xml
 .DS_Store
 .codex/
 
+# Private customer inputs and local verification output must not be published.
+privateinputs/
+testoutputs/
+
 # Locally reviewed configurations contain account-specific AWS resource IDs.
 config/*.reviewed.yaml
 config/*.enabled.yaml
 
 # Local validation records contain account and resource identifiers.
+docs/cpu-test-evidence-20261111.md
+docs/cpu-test-receipt-20261111.json
+docs/cpu-test-receipt-run2-20261111.json
+docs/cpu-test-rejected-intent-20261111.json
+docs/cpu-test-run2-evidence-20261111.md
+docs/cpu-test-runbook.md
+docs/cpu-test-validation-20261111/
+deployment/cpu-validation-runtime-policy.json
+deployment/cpu-validation-iam-recipe.md
 docs/account-input-inventory.md
 docs/sps-region-selection-validation.md
 docs/validation-deployment-plan.md

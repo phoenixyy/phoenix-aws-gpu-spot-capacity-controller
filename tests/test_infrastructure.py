@@ -1,4 +1,5 @@
 import unittest
+from tempfile import TemporaryDirectory
 
 try:
     import aws_cdk as cdk
@@ -23,7 +24,9 @@ def _walk(value):
 @unittest.skipUnless(CDK_AVAILABLE, "CDK dependencies are installed in the project validation environment")
 class InfrastructureTests(unittest.TestCase):
     def setUp(self):
-        app = cdk.App()
+        directory = TemporaryDirectory(prefix="gpu-spot-infrastructure-")
+        self.addCleanup(directory.cleanup)
+        app = cdk.App(outdir=directory.name)
         self.template = assertions.Template.from_stack(CapacityControllerStack(app, "TestCapacityController")).to_json()
 
     def test_state_is_encrypted_and_retained(self):

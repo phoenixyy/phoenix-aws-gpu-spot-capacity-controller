@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "h100-spot-capacity-controller"
-version = "0.1.0"
-description = "Safe, persistent EC2 Fleet controller for H100 Spot capacity"
+version = "0.2.0"
+description = "Safe, persistent GPU Spot capacity controller with isolated HYD B300 acquisition"
 requires-python = ">=3.11"
 dependencies = [
   "boto3>=1.34,<2",

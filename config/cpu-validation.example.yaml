@@ -1,0 +1,39 @@
+# Disabled, offline-only example. Replace every fixture ID after operator review.
+# Do not enable until an isolated run's reviewed UTC window and launch inputs exist.
+target_id: cpu-validation-example
+enabled: false
+accelerator_profile: cpu-validation
+acquisition_profile: generic
+placement_strategy: all-approved
+integration_mode: standalone
+region_selection:
+  mode: manual
+active_region: ap-northeast-2
+desired_instance_count: 1
+maximum_instance_count: 1
+validation_run_id: example-run
+validation_started_at: null
+validation_expires_at: null
+validation_review_budget_usd: "1.00"
+capacity_rebalancing: false
+excess_instance_termination: false
+ownership_tags:
+  purpose: cpu-spot-validation
+  validation-run-id: example-run
+instance_types:
+  - name: c6i.large
+    spot_price_cap_usd: "0.10"
+candidate_regions:
+  - region: ap-northeast-2
+    launch_template_id: lt-REPLACE
+    launch_template_version: "1"
+    ami_id: ami-REPLACE
+    iam_instance_profile_arn: arn:aws:iam::000000000000:instance-profile/REPLACE
+    security_group_ids: [sg-REPLACE]
+    bootstrap_contract_version: cpu-validation-v1
+    user_data_sha256: null
+    root_volume_encrypted: true
+    standard_placements:
+      - subnet_id: subnet-REPLACE
+        zone_id: apne2-az1
+    local_zone_placements: []

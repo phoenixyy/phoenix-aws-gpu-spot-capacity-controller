@@ -4,14 +4,26 @@ from __future__ import annotations
 
 from hashlib import sha256
 from dataclasses import dataclass, replace
+from decimal import Decimal, InvalidOperation
+from datetime import datetime, timezone
 import json
 from typing import Any, Iterable
 
 from .config import CapacityTarget, ConfigurationError
-from .outcomes import ReconciliationOutcome
+from .outcomes import ReconciliationOutcome, classify_fleet_errors
 
 
 INACTIVE_FLEET_STATES = {"deleted", "deleted_running", "deleted_terminating"}
+
+
+class FleetOwnershipError(RuntimeError):
+    """Discovery found competing requests; never repair them destructively."""
+
+
+def find_fleet_by_id(ec2: Any, fleet_id: str) -> dict[str, Any] | None:
+    """A missing result is inconclusive, not authorization for a new generation."""
+    response = ec2.describe_fleets(FleetIds=[fleet_id])
+    return next((item for item in response.get("Fleets", ()) if item.get("FleetId") == fleet_id), None)
 
 
 def _fleet_state(fleet: dict[str, Any]) -> str | None:
@@ -43,7 +55,7 @@ def find_owned_fleet(ec2: Any, target: CapacityTarget) -> dict[str, Any] | None:
     """Return the sole active owned fleet, rejecting an ownership invariant breach."""
     owned = find_owned_fleets(ec2, target)
     if len(owned) > 1:
-        raise RuntimeError(f"target {target.target_id} has more than one owned fleet")
+        raise FleetOwnershipError(f"target {target.target_id} has more than one owned fleet")
     return owned[0] if owned else None
 
 
@@ -57,10 +69,28 @@ class FleetCapacityObservation:
     owned_instance_ids: tuple[str, ...]
 
 
+def _fleet_instance_pages(ec2: Any, fleet_id: str):
+    """Return DescribeFleetInstances pages.
+
+    botocore has no paginator for this operation. Treating that as an empty
+    page would hide live capacity, so fall back to the direct call.
+    """
+    if hasattr(ec2, "get_paginator"):
+        try:
+            return ec2.get_paginator("describe_fleet_instances").paginate(FleetId=fleet_id)
+        except Exception as error:
+            if type(error).__name__ != "OperationNotPageableError":
+                raise
+    response = ec2.describe_fleet_instances(FleetId=fleet_id)
+    if response.get("NextToken"):
+        raise ValueError("describe_fleet_instances inventory is incomplete without a paginator")
+    return [response]
+
+
 def observe_fleet_capacity(ec2: Any, fleet: dict[str, Any], target: CapacityTarget) -> FleetCapacityObservation:
     """Count running/pending owned Fleet instances by Zone and instance type."""
-    response = ec2.describe_fleet_instances(FleetId=fleet["FleetId"])
-    instance_ids = [item["InstanceId"] for item in response.get("ActiveInstances", []) if item.get("InstanceId")]
+    pages = _fleet_instance_pages(ec2, fleet["FleetId"])
+    instance_ids = sorted({item["InstanceId"] for page in pages for item in page.get("ActiveInstances", []) if item.get("InstanceId")})
     if not instance_ids:
         return FleetCapacityObservation({}, {}, 0, {}, 0, ())
     described = ec2.describe_instances(InstanceIds=instance_ids)
@@ -164,18 +194,23 @@ def fleet_request(target: CapacityTarget, active_zone_ids: tuple[str, ...], pric
     placements_by_zone = {p.zone_id: p for p in (*region.standard_placements, *region.local_zone_placements)}
     placements = [placements_by_zone[zone_id] for zone_id in active_zone_ids if zone_id in placements_by_zone]
     if not placements:
-        placements = [region.standard_placements[0]]
+        placements = list(region.standard_placements) if target.placement_strategy == "all-approved" or target.accelerator_profile == "cpu-validation" else [region.standard_placements[0]]
     overrides = []
     for priority, placement in enumerate(placements):
         for instance in target.instance_types:
             cap = (price_caps or {}).get(instance.name, instance.spot_price_cap_usd)
             if cap is None:
                 raise ConfigurationError(f"no resolved Linux On-Demand Spot ceiling for {instance.name}")
+            cap = Decimal(str(cap))
+            if instance.spot_price_cap_usd is not None:
+                cap = min(cap, instance.spot_price_cap_usd)
+            if not cap.is_finite() or cap <= 0:
+                raise ConfigurationError(f"invalid effective Spot ceiling for {instance.name}")
             overrides.append({
                 "InstanceType": instance.name,
                 "SubnetId": placement.subnet_id,
                 "MaxPrice": str(cap),
-                "WeightedCapacity": 1.0,
+                "WeightedCapacity": 1,
                 "Priority": priority,
             })
     request = {
@@ -184,18 +219,38 @@ def fleet_request(target: CapacityTarget, active_zone_ids: tuple[str, ...], pric
         "LaunchTemplateConfigs": [{"LaunchTemplateSpecification": {"LaunchTemplateId": region.launch_template_id, "Version": region.launch_template_version}, "Overrides": overrides}],
         "TagSpecifications": [{"ResourceType": "fleet", "Tags": [{"Key": key, "Value": value} for key, value in target.tags.items()]}],
     }
+    if target.accelerator_profile == "cpu-validation":
+        target.validate()
+        if target.validation_expires_at is None:
+            raise ConfigurationError("CPU Fleet preview requires an explicitly reviewed start/expiry window")
+        request["ValidUntil"] = target.validation_expires_at
+        request["TerminateInstancesWithExpiration"] = True
     token_material = json.dumps({"request": request, "epoch": request_epoch}, sort_keys=True, separators=(",", ":"))
     return {"ClientToken": sha256(token_material.encode()).hexdigest()[:64], **request}
 
 
-def _same_launch_template_configs(fleet: dict[str, Any], request: dict[str, Any]) -> bool:
+def _same_launch_template_configs(fleet: dict[str, Any], request: dict[str, Any], *, numeric_price_comparison: bool = False) -> bool:
     """Compare desired launch inputs after normalizing the EC2 response shape.
 
     ``DescribeFleets`` returns an Availability Zone name even when ``CreateFleet``
     used an Availability Zone ID, and serializes priority/weight as floats. The
     approved subnet already fixes the Zone, so those representation differences
     must not cause an unnecessary ``ModifyFleet`` call every reconciliation.
+    CPU-only numeric price comparison tolerates AWS dropping trailing zeros.
+    It never rewrites the frozen request or token. Invalid or missing prices
+    cannot compare equal, including when both sides have the same invalid value.
+    Generic/GPU comparison deliberately retains its existing string behavior.
     """
+    def price(value: Any) -> str | Decimal:
+        if not numeric_price_comparison:
+            return str(value)
+        result = Decimal(str(value))
+        if not result.is_finite() or result <= 0:
+            raise ValueError("a positive finite MaxPrice is required")
+        # Decimal equality is exact across differing scales; normalize()/quantize()
+        # could round under the caller's decimal context, so do not use them.
+        return result
+
     def normalized(configs: list[dict[str, Any]]) -> list[dict[str, Any]]:
         result: list[dict[str, Any]] = []
         for config in configs:
@@ -203,7 +258,7 @@ def _same_launch_template_configs(fleet: dict[str, Any], request: dict[str, Any]
             overrides = [{
                 "InstanceType": item.get("InstanceType"),
                 "SubnetId": item.get("SubnetId"),
-                "MaxPrice": str(item.get("MaxPrice")),
+                "MaxPrice": price(item.get("MaxPrice")),
                 "WeightedCapacity": float(item.get("WeightedCapacity", 0)),
                 "Priority": float(item.get("Priority", 0)),
             } for item in config.get("Overrides", [])]
@@ -220,7 +275,12 @@ def _same_launch_template_configs(fleet: dict[str, Any], request: dict[str, Any]
             })
         return sorted(result, key=lambda item: (item["LaunchTemplateId"] or "", item["Version"]))
 
-    return normalized(fleet.get("LaunchTemplateConfigs", [])) == normalized(request["LaunchTemplateConfigs"])
+    try:
+        return normalized(fleet.get("LaunchTemplateConfigs", [])) == normalized(request["LaunchTemplateConfigs"])
+    except (InvalidOperation, ValueError):
+        if not numeric_price_comparison:
+            raise
+        return False
 
 
 def reconcile_fleet(ec2: Any, target: CapacityTarget, fleet_id: str | None, active_zone_ids: tuple[str, ...], fulfilled: int, price_caps: dict[str, Any] | None = None, request_epoch: str | None = None) -> ReconciliationOutcome:
@@ -231,13 +291,17 @@ def reconcile_fleet(ec2: Any, target: CapacityTarget, fleet_id: str | None, acti
     """
     if not target.enabled:
         return ReconciliationOutcome("disabled", target.target_id, target.active_region, target.desired_instance_count, fulfilled)
+    if target.accelerator_profile == "cpu-validation":
+        kind = target.validation_window_status(datetime.now(timezone.utc)) or "preflight_blocked"
+        return ReconciliationOutcome(kind, target.target_id, target.active_region,
+                                     target.desired_instance_count, fulfilled, "CPU_REQUIRES_RECOVERABLE_RECONCILER")
     request = fleet_request(target, active_zone_ids, price_caps, request_epoch)
     if fleet_id is None:
         ec2.create_fleet(**request)
     return ReconciliationOutcome("healthy" if fulfilled >= target.desired_instance_count else "shortfall", target.target_id, target.active_region, target.desired_instance_count, fulfilled)
 
 
-def reconcile_existing_fleet(ec2: Any, target: CapacityTarget, fleet: dict[str, Any], active_zone_ids: tuple[str, ...], fulfilled: int, price_caps: dict[str, Any] | None = None) -> ReconciliationOutcome:
+def reconcile_existing_fleet(ec2: Any, target: CapacityTarget, fleet: dict[str, Any], active_zone_ids: tuple[str, ...], fulfilled: int, price_caps: dict[str, Any] | None = None, *, now: datetime | None = None) -> ReconciliationOutcome:
     """Modify only an owned maintain fleet when the eligible pools changed.
 
     The desired machine count is always copied unchanged from the validated
@@ -245,22 +309,55 @@ def reconcile_existing_fleet(ec2: Any, target: CapacityTarget, fleet: dict[str, 
     """
     if not target.enabled:
         return ReconciliationOutcome("disabled", target.target_id, target.active_region, target.desired_instance_count, fulfilled)
+    if target.accelerator_profile == "cpu-validation":
+        window = target.validation_window_status(now or datetime.now(timezone.utc))
+        if window:
+            return ReconciliationOutcome(window, target.target_id, target.active_region, target.desired_instance_count, fulfilled)
+        from .config import parse_validation_timestamp
+        try:
+            valid_until = fleet.get("ValidUntil")
+            if isinstance(valid_until, datetime):
+                valid_until = valid_until.isoformat()
+            expiration_matches = (parse_validation_timestamp(valid_until) == parse_validation_timestamp(target.validation_expires_at)
+                                  and fleet.get("TerminateInstancesWithExpiration") is True)
+        except ConfigurationError:
+            expiration_matches = False
+        if not expiration_matches:
+            return ReconciliationOutcome("creation_conflict", target.target_id, target.active_region,
+                                         target.desired_instance_count, fulfilled, "CPU_FLEET_EXPIRY_MISMATCH")
     if not is_owned_fleet(fleet, target):
         return ReconciliationOutcome("ownership_mismatch", target.target_id, target.active_region, target.desired_instance_count, fulfilled)
-    if fleet.get("Type") != "maintain":
-        return ReconciliationOutcome("invalid_fleet", target.target_id, target.active_region, target.desired_instance_count, fulfilled)
+    purchase = fleet.get("TargetCapacitySpecification", {})
+    if (purchase.get("DefaultTargetCapacityType") == "on-demand" or
+            purchase.get("OnDemandTargetCapacity", 0) or fleet.get("FulfilledOnDemandCapacity", 0)):
+        return ReconciliationOutcome("invalid_fleet", target.target_id, target.active_region,
+                                     target.desired_instance_count, fulfilled, "FLEET_NOT_SPOT_ONLY")
+    if fleet.get("Type") != "maintain" or _fleet_state(fleet) == "failed":
+        return ReconciliationOutcome("invalid_fleet", target.target_id, target.active_region, target.desired_instance_count, fulfilled, "FLEET_NOT_MAINTAINING")
+    if _fleet_state(fleet) in {"submitted", "modifying"}:
+        return ReconciliationOutcome("creation_pending", target.target_id, target.active_region, target.desired_instance_count, fulfilled, "FLEET_TRANSITION_PENDING")
     request = fleet_request(target, active_zone_ids, price_caps)
     current_target = fleet.get("TargetCapacitySpecification", {}).get("TotalTargetCapacity")
     if current_target is not None and current_target > target.desired_instance_count and not target.excess_instance_termination:
         return ReconciliationOutcome("configuration_error", target.target_id, target.active_region, target.desired_instance_count, fulfilled, "EXCESS_TERMINATION_APPROVAL_REQUIRED")
     capacity_changed = current_target is not None and current_target != target.desired_instance_count
-    if not _same_launch_template_configs(fleet, request) or capacity_changed:
-        ec2.modify_fleet(
+    if not _same_launch_template_configs(fleet, request, numeric_price_comparison=target.accelerator_profile == "cpu-validation") or capacity_changed:
+        if target.accelerator_profile == "cpu-validation":
+            return ReconciliationOutcome("creation_conflict", target.target_id, target.active_region,
+                                         target.desired_instance_count, fulfilled, "CPU_FROZEN_FLEET_CONTRACT_CHANGED")
+        response = ec2.modify_fleet(
             FleetId=fleet["FleetId"],
             LaunchTemplateConfigs=request["LaunchTemplateConfigs"],
             TargetCapacitySpecification=request["TargetCapacitySpecification"],
             ExcessCapacityTerminationPolicy="termination" if current_target is not None and current_target > target.desired_instance_count else "no-termination",
         )
+        if response is not None and response.get("Return") is False:
+            return ReconciliationOutcome("dependency_error", target.target_id, target.active_region,
+                                         target.desired_instance_count, fulfilled, "MODIFY_FLEET_NOT_ACCEPTED")
+    elif fulfilled < target.desired_instance_count and fleet.get("Errors"):
+        kind, codes = classify_fleet_errors(fleet["Errors"])
+        return ReconciliationOutcome(kind, target.target_id, target.active_region,
+                                     target.desired_instance_count, fulfilled, codes[0], fleet["FleetId"], codes)
     return ReconciliationOutcome("healthy" if fulfilled >= target.desired_instance_count else "shortfall", target.target_id, target.active_region, target.desired_instance_count, fulfilled)
 
 

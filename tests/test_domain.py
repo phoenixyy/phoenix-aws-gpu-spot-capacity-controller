@@ -192,6 +192,7 @@ class DomainTests(unittest.TestCase):
         class Client:
             def describe_fleets(self): return {"Fleets": [fleet]}
             def describe_fleet_instances(self, **kwargs): return {"ActiveInstances": []}
+            def describe_instances(self, **kwargs): return {"Reservations": []}
             def modify_fleet(self, **kwargs): pass
         store = InMemoryStateStore()
         store.put_if_version(VersionedState(target.target_id, 1, target.active_region, ("use1-az1",), now - timedelta(minutes=15)), None)
@@ -1114,7 +1115,7 @@ class DomainTests(unittest.TestCase):
         target = target_from_mapping(target_mapping())
         first = fleet_request(target, ("use1-az1",))
         repeated = fleet_request(target, ("use1-az1",))
-        changed = fleet_request(target, ("use1-az1",), {"p5.48xlarge": 55.04})
+        changed = fleet_request(target, ("use1-az1",), {"p5.48xlarge": 5.04})
         replacement = fleet_request(target, ("use1-az1",), request_epoch="replacement-epoch")
         self.assertEqual(first["ClientToken"], repeated["ClientToken"])
         self.assertNotEqual(first["ClientToken"], changed["ClientToken"])
@@ -1131,20 +1132,24 @@ class DomainTests(unittest.TestCase):
         )
         class Client:
             created = []
-            def describe_fleets(self): return {"Fleets": []}
+            def describe_fleets(self, **kwargs):
+                return {"Fleets": [{"FleetId": "fleet-deleted", "FleetState": "deleted",
+                                    "Tags": [{"Key": k, "Value": v} for k, v in target.tags.items()]}]} if kwargs.get("FleetIds") else {"Fleets": []}
             def describe_instances(self, **kwargs): return {"Reservations": []}
-            def create_fleet(self, **kwargs): self.created.append(kwargs)
+            def create_fleet(self, **kwargs):
+                self.created.append(kwargs)
+                return {}  # Deliberately ambiguous response must preserve the new token.
         client = Client()
         now = datetime.now(timezone.utc)
         first = reconcile_target(client, target, store, now)
-        self.assertEqual("shortfall", first.kind)
+        self.assertEqual("creation_pending", first.kind)
         self.assertEqual(1, len(client.created))
         self.assertNotEqual(
             fleet_request(target, ("use1-az1",), request_epoch="old-epoch")["ClientToken"],
             client.created[0]["ClientToken"],
         )
         second = reconcile_target(client, target, store, now + timedelta(seconds=1))
-        self.assertEqual("shortfall", second.kind)
+        self.assertEqual("creation_pending", second.kind)
         self.assertEqual(2, len(client.created))
         self.assertEqual(client.created[0]["ClientToken"], client.created[1]["ClientToken"])
 
@@ -1167,10 +1172,12 @@ class DomainTests(unittest.TestCase):
             stubber.add_response("modify_fleet", {"Return": True}, modify)
             client.modify_fleet(**modify)
 
-    def test_ondemand_cap_overrides_static_example_cap_in_fleet_request(self):
+    def test_static_customer_cap_is_not_overridden_by_ondemand_ceiling(self):
         from decimal import Decimal
         request = fleet_request(target_from_mapping(target_mapping()), ("use1-az1",), {"p5.48xlarge": Decimal("55.04")})
-        self.assertEqual("55.04", request["LaunchTemplateConfigs"][0]["Overrides"][0]["MaxPrice"])
+        self.assertEqual("10", request["LaunchTemplateConfigs"][0]["Overrides"][0]["MaxPrice"])
+        lower = fleet_request(target_from_mapping(target_mapping()), ("use1-az1",), {"p5.48xlarge": Decimal("5.04")})
+        self.assertEqual("5.04", lower["LaunchTemplateConfigs"][0]["Overrides"][0]["MaxPrice"])
 
     def test_automatic_price_source_requires_resolved_ondemand_ceiling_before_fleet_write(self):
         data = target_mapping(); data["instance_types"][0].pop("spot_price_cap_usd")

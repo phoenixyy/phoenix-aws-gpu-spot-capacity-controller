@@ -59,8 +59,35 @@ def describe_gpu_instance_types(ec2: Any, instance_types: tuple[str, ...]) -> di
     return descriptors
 
 
+def describe_cpu_instance_types(ec2: Any, instance_types: tuple[str, ...]) -> dict[str, dict[str, Any]]:
+    """Verify the sole test CPU explicitly; malformed/failed evidence blocks."""
+    if instance_types != ("c6i.large",):
+        raise GpuMetadataError("CPU_METADATA_TYPE_UNAPPROVED")
+    try:
+        items = ec2.describe_instance_types(InstanceTypes=list(instance_types)).get("InstanceTypes", [])
+        if len(items) != 1 or items[0].get("InstanceType") != "c6i.large":
+            raise ValueError("exact CPU metadata is required")
+        item = items[0]
+        if (type(item.get("VCpuInfo", {}).get("DefaultVCpus")) is not int
+                or item["VCpuInfo"]["DefaultVCpus"] != 2
+                or type(item.get("MemoryInfo", {}).get("SizeInMiB")) is not int
+                or item["MemoryInfo"]["SizeInMiB"] != 4096
+                or item.get("ProcessorInfo", {}).get("SupportedArchitectures") != ["x86_64"]
+                or "spot" not in item.get("SupportedUsageClasses", [])
+                or any(key in item for key in ("GpuInfo", "FpgaInfo", "InferenceAcceleratorInfo", "NeuronInfo"))):
+            raise ValueError("CPU identity, architecture, zero accelerators and Spot support must be verified")
+        return {"c6i.large": item}
+    except Exception as error:
+        code = getattr(error, "response", {}).get("Error", {}).get("Code", type(error).__name__)
+        raise GpuMetadataError(f"CPU_METADATA_UNVERIFIED:{code}") from error
+
+
 def target_with_gpu_metadata(target: CapacityTarget, ec2: Any) -> tuple[CapacityTarget, dict[str, GpuDescriptor]]:
     """Attach verified metadata to an in-memory target; never changes stored config."""
+    if target.accelerator_profile == "cpu-validation":
+        target.validate()
+        describe_cpu_instance_types(ec2, tuple(item.name for item in target.instance_types))
+        return target, {}
     if target.accelerator_profile == "functional-validation":
         descriptors = {item.name: GpuDescriptor(item.name, "NVIDIA", item.accelerator_model, item.accelerator_count) for item in target.instance_types}
         return target, descriptors

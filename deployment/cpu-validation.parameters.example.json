@@ -1,0 +1,9 @@
+[
+  {"ParameterKey": "ApprovedAmiId", "ParameterValue": "ami-REPLACE-WITH-ROOT-REVIEWED-AL2023-X86-64"},
+  {"ParameterKey": "DefaultVpcId", "ParameterValue": "vpc-REPLACE-WITH-ROOT-REVIEWED-DEFAULT-VPC"},
+  {"ParameterKey": "ApprovedSubnetIds", "ParameterValue": "subnet-REPLACE-WITH-ROOT-REVIEWED-STANDARD-AZ-PLACEMENTS"},
+  {"ParameterKey": "StagingBucket", "ParameterValue": "replace-with-approved-staging-bucket"},
+  {"ParameterKey": "LambdaZipKey", "ParameterValue": "Phoenix-Codex-Local-Spot-cpu-example/cpu-lambda.zip"},
+  {"ParameterKey": "RootDeviceName", "ParameterValue": "/dev/xvda"},
+  {"ParameterKey": "RootVolumeGiB", "ParameterValue": "8"}
+]

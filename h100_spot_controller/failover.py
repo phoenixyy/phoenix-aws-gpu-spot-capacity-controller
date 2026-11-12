@@ -72,6 +72,10 @@ def build_failover_plan(
     trigger: str = "capacity-shortfall",
 ) -> FailoverPlan:
     """Plan a complete target move to an approved Region; no AWS calls."""
+    if target.accelerator_profile == "cpu-validation":
+        raise ValueError("CPU validation does not permit failover plans")
+    if target.acquisition_profile == "hyd-b300":
+        raise ValueError("HYD B300 acquisition does not permit Region migration")
     candidates = [item.region for item in target.candidate_regions]
     source_index = candidates.index(target.active_region)
     if len(candidates) < 2:
@@ -102,7 +106,20 @@ def build_failover_plan(
 
 def target_configuration_version(target: CapacityTarget) -> int:
     """Stable version that changes whenever the reviewed target contract changes."""
-    material = json.dumps(asdict(target), sort_keys=True, default=str, separators=(",", ":"))
+    contract = asdict(target)
+    if target.accelerator_profile != "cpu-validation":
+        for key in ("validation_run_id", "validation_started_at", "validation_expires_at", "validation_review_budget_usd"):
+            contract.pop(key, None)
+    if contract.get("acquisition_profile") == "generic":
+        contract.pop("acquisition_profile", None)
+    if contract.get("placement_strategy") == "sequential":
+        contract.pop("placement_strategy", None)
+    # Derived metadata is evidence, not an operator configuration edit. Keep
+    # legacy raw-production values in the hash to preserve old config versions.
+    if target.accelerator_profile == "gpu-production":
+        for instance in contract["instance_types"]:
+            instance.update(accelerator_model="unknown", accelerator_count=0, h100_gpu_count=0)
+    material = json.dumps(contract, sort_keys=True, default=str, separators=(",", ":"))
     return int(sha256(material.encode()).hexdigest()[:15], 16)
 
 
@@ -378,6 +395,9 @@ def execute_approved_failover(
     A caller must re-describe the source on subsequent invocations.  This makes
     the zero-source barrier observable rather than assuming termination worked.
     """
+    if target.accelerator_profile == "cpu-validation":
+        return ReconciliationOutcome("configuration_error", target.target_id, target.active_region,
+                                     target.desired_instance_count, len(source_instances), "CPU_FAILOVER_PROHIBITED")
     continuing_claimed_plan = (
         approval.used
         and approval.execution_claimed_at is not None

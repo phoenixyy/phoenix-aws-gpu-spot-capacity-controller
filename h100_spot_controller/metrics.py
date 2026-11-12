@@ -26,6 +26,10 @@ def metric_data(
         {"Name": "Region", "Value": outcome.active_region},
         {"Name": "AcceleratorProfile", "Value": accelerator_profile},
     ]
+    if accelerator_profile == "cpu-validation":
+        realized_h100_gpu_count = 0
+        realized_accelerator_count = 0
+        accelerator_counts_by_model = {}
     realized_accelerator_count = realized_h100_gpu_count if realized_accelerator_count is None else realized_accelerator_count
     data = [
         {"MetricName": "DesiredMachineCapacity", "Unit": "Count", "Value": outcome.desired_machine_count, "Dimensions": dimensions},

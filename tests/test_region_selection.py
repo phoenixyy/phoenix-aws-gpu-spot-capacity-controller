@@ -409,6 +409,7 @@ class RegionSelectionTests(unittest.TestCase):
                     self.fail_once = False
                     raise RuntimeError("transient")
                 self.created.append(kwargs)
+                return {"FleetId": "fleet-west", "Errors": []}
 
         class Pricing:
             def get_products(self, **kwargs):

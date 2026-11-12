@@ -1,4 +1,6 @@
-"""H100 Spot Capacity Controller domain package."""
+"""GPU Spot Capacity Controller; legacy package and CLI names remain compatible."""
+
+__version__ = "0.2.0"
 
 from .config import CapacityTarget, ConfigurationError, load_target
 

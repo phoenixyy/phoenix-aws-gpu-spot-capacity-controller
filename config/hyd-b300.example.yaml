@@ -1,0 +1,45 @@
+# Disabled independent-instance HYD example: this is not live capacity evidence.
+# Replace every REPLACE placeholder using separately authorized read-only discovery.
+# AZ identifiers below are samples, not assumed live B300 offerings in any account.
+# Eligibility (B300/Spot metadata, subnet/launch contract, quota) is not Spot stock.
+# A maintain Fleet replenishes machines, not workloads; no multi-AZ gang guarantee.
+# Use customer-b and a different target/deployment namespace for a second customer.
+# Pausing enabled=false does not cancel an existing AWS maintain Fleet demand.
+target_id: customer-a-hyd-b300-independent
+ownership_tags:
+  customer-id: customer-a
+acquisition_profile: hyd-b300
+accelerator_profile: gpu-production
+placement_strategy: all-approved
+enabled: false
+desired_instance_count: 1
+maximum_instance_count: 1
+active_region: ap-south-2
+region_selection:
+  mode: manual
+integration_mode: standalone
+capacity_rebalancing: false
+excess_instance_termination: false
+price_cap_source: linux-ondemand
+notification_topic_arn: null
+instance_types:
+  - name: p6-b300.48xlarge
+    # Add a reviewed positive spot_price_cap_usd budget: effective cap is the
+    # lower of that customer cap and the resolved Linux On-Demand ceiling.
+candidate_regions:
+  - region: ap-south-2
+    launch_template_id: lt-REPLACE_CUSTOMER_A
+    launch_template_version: "1"
+    ami_id: ami-REPLACE_APPROVED_B300_AMI
+    iam_instance_profile_arn: arn:aws:iam::ACCOUNT_ID:instance-profile/REPLACE_CUSTOMER_A
+    security_group_ids: [sg-REPLACE_CUSTOMER_A]
+    bootstrap_contract_version: standalone-b300-v1
+    user_data_sha256: REPLACE_WITH_APPROVED_SHA256
+    root_volume_encrypted: true
+    root_volume_kms_key_arn: null
+    standard_placements:
+      - subnet_id: subnet-REPLACE_APPROVED_HYD_A
+        zone_id: aps2-az1 # SAMPLE: replace with account-approved standard AZ ID.
+      - subnet_id: subnet-REPLACE_APPROVED_HYD_B
+        zone_id: aps2-az2 # SAMPLE: verify offering; no claim B300 is supported here.
+    local_zone_placements: []
