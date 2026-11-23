@@ -29,6 +29,7 @@ eks:
     topology.kubernetes.io/zone: REPLACE_AZ_NAME
     node.kubernetes.io/instance-type: REPLACE_GPU_TYPE
     capacity-source: spot
+    spot-controller.phoenix.dev/nth-enabled: 'true'
   gpu_taint: 'nvidia.com/gpu=true:NoSchedule'
   source_drain_procedure: 'REPLACE_WITH_REVIEWED_DRAIN_RUNBOOK'
 ```
@@ -41,9 +42,13 @@ eks:
 
 管理员确认实例 profile 中的节点角色可注册；AMI/驱动与机型匹配；bootstrap 指向正确集群；网络可到 API endpoint；标签、GPU taint 满足调度要求。controller 只核对 launch contract，不替代 EKS 注册测试。权限或安全设置有疑问停在这里审核，不自动放宽。
 
-## 4. 只读检查、部署、启用
+## 4. 接入节点中断处理，再启用容量
 
-完成 [通用 GPU 第 3–6 步](generic-gpu.md)，包括 discover/dry-run、CDK diff/deploy、先写 disabled、再有条件启用。YAML 不同，但 CLI 仍然相同。
+本仓库现在提供独立 [AWS Node Termination Handler 分步指南](eks-node-termination-handler.md) 和 `scripts/nth-values.py` 离线生成器。NTH IMDS DaemonSet 处理节点 cordon/drain；Fleet 继续负责机器补位。容量 Lambda 仍不调用 Kubernetes API，CDK 不自动安装 NTH。
+
+先完成通用 GPU 第 3–5 步（只读检查、部署控制平面、写入 disabled），再按 NTH 指南核对版本/RBAC、生成 dry-run values、在明确批准的集群安装并审核激活。最后才走通用 GPU 第 6 步启用容量，并在第一批节点出现后检查 NTH 覆盖（没有节点时 DaemonSet desired=0 不能算验收）。
+
+NTH pin 的兼容范围、opt-in 节点标签、GPU toleration、PDB/本地数据保护、验收和卸载全部在独立指南。它不保证捕捉手动 TerminateInstances；跨区迁移或人工清理仍先明确 drain。已有其他节点终止管理器时先审核，不重复部署。
 
 **检查点分两层：**
 

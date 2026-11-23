@@ -14,7 +14,7 @@
 |---|---|---|---|
 | Hyderabad 申请 B300 Spot | [B300 独立部署](docs/guides/b300.md) | [B300 example](config/hyd-b300.example.yaml) | 固定 ap-south-2 / p6-b300.48xlarge；B300 客户实机部署/获配尚未验证 |
 | 单区域维持其他 GPU Spot | [通用 GPU standalone](docs/guides/generic-gpu.md) | [通用 example](config/target.example.yaml) | 先人工准备启动输入，默认关闭，启用后才申请机器 |
-| 给已有 EKS 提供 GPU EC2 | [已有 EKS](docs/guides/existing-eks.md) | 通用 example，修改 integration_mode | 不创建集群、不管节点注册/Pod；HYD B300 不支持此模式 |
+| 给已有 EKS 提供 GPU EC2 | [已有 EKS](docs/guides/existing-eks.md) + [NTH 中断处理](docs/guides/eks-node-termination-handler.md) | 通用 example，修改 integration_mode | 独立 IMDS NTH cordon/drain；不创建集群或恢复任务，需审核安装；HYD B300 不支持 |
 | 比较区域、首次选区或申请迁移 | [区域选择与迁移](docs/guides/regions.md) | 通用 example，准备所有候选区域 | 迁移需批准，先停源再建目的；B300/CPU 不允许跨区 |
 | 没有 GPU quota，先验证 CPU | [CPU 验证](docs/guides/cpu-test.md) | [CPU example](config/cpu-validation.example.yaml) | 本地检查可用；任意账户云端部署尚需适配，不能直接套标准 CDK |
 | 用完停止花钱 | [暂停、取消与清理](docs/guides/stop-and-cleanup.md) | 你自己的配置 | enabled=false 不取消已有 Fleet，删 stack 也不取消 Fleet |
@@ -85,6 +85,7 @@ python3 -m venv .venv
 | [infrastructure.py](h100_spot_controller/infrastructure.py) | Lambda/状态表/定时器/监控/IAM 的 CDK 定义 | 部署前审核；不靠随意加权限解决拒绝 |
 | [cpu_test_deployment.py](h100_spot_controller/cpu_test_deployment.py) 与 [CPU 打包脚本](scripts/build-cpu-test-package.py) | 原隔离 CPU 实验的模板/离线打包工具 | 离线账号占位符，不是任意账户自动部署工具 |
 | [requirements.lock](requirements.lock)、[pyproject.toml](pyproject.toml) | 依赖和项目安装入口 | 按安装步骤使用 |
+| [scripts/nth-values.py](scripts/nth-values.py)、[nth.py](h100_spot_controller/nth.py) | 从 existing-eks target 生成固定版本 NTH Helm values | 默认 dry-run；真实 drain 须明确确认；不自动连接集群 |
 | [scripts/release-check.py](scripts/release-check.py)、[tests/](tests/) | 离线回归检查 | 修改后运行，不拿它代替实机验收 |
 | [openspec/](openspec/) | 行为规范和设计变更 | 开发者阅读；不是部署步骤入口 |
 | [deployment/](deployment/) | 历史验证模板/参数输入 | 不默认当客户生产模板；含验证 fixture 的输入必须替换 |

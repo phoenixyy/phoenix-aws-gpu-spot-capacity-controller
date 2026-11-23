@@ -79,6 +79,8 @@ The controller begins in one standard AZ, retains an AZ that has capacity as hig
 
 For `existing-eks`, EC2 Fleet fulfillment and EKS readiness are distinct. A node that fails to register points to a launch-template, bootstrap, or EKS access issue; it must not increase desired Fleet capacity.
 
+Self-managed Spot nodes may use this repository's independent [pinned NTH IMDS integration](guides/eks-node-termination-handler.md): generate values offline, review cluster-wide RBAC and explicit target/Spot/opt-in selectors, install dry-run, then separately authorize real interruption cordon/drain. No AWS IAM/SQS or capacity-controller Kubernetes access is added. Default rebalance handling is off; manual termination/failover still requires operator drain. Live NTH interruption acceptance has NOT RUN.
+
 The controller does not call the Kubernetes API. An operator-owned integration may write a readiness snapshot to the state table at `pk=TARGET#<target-id>`, `sk=EKS_READINESS#<region>` with `registered_node_count`, `ready_node_count`, and `observed_at`. The controller publishes those values as separate CloudWatch metrics and never feeds them into Fleet desired capacity.
 
 The DynamoDB state/configuration table, controller SNS topic, and Lambda log groups are retained if the CloudFormation stack is deleted. DynamoDB point-in-time recovery is enabled; notification deduplication and failover records use TTL where appropriate. Lambda logs expire after 30 days. Lambda functions, EventBridge rules, IAM resources, and dashboards follow normal stack deletion. EC2 Fleet cancellation and instance termination always remain separate, explicit operator actions.
